@@ -5,7 +5,7 @@ use std::hint::black_box;
 fn benchmark(c: &mut Criterion) {
     let file_content = std::fs::read_to_string("10mb.json").unwrap();
 
-    c.bench_function("twitter.json", |b| {
+    c.bench_function("10mb", |b| {
         b.iter(|| {
             // Code to benchmark
             let result = parse_json(black_box(&file_content));
