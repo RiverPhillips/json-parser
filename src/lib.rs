@@ -10,14 +10,13 @@ pub enum JsonValue {
     Object(HashMap<String, JsonValue>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct JsonError {
     pub message: String,
     pub position: usize,
     pub kind: JsonErrorKind,
 }
-
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum JsonErrorKind {
     UnexpectedCharacter,
     MalformedObject,
@@ -25,6 +24,42 @@ pub enum JsonErrorKind {
     InvalidNumber,
     InvalidString,
     UnexpectedEndOfInput,
+    UnterminatedString,
+    InvalidEscapeSequence,
+}
+
+impl JsonError {
+    fn unexpected_character(position: usize) -> Self {
+        Self {
+            message: "Unexpected character".to_string(),
+            position,
+            kind: JsonErrorKind::UnexpectedCharacter,
+        }
+    }
+
+    fn invalid_literal(position: usize) -> Self {
+        Self {
+            message: "Invalid literal".to_string(),
+            position,
+            kind: JsonErrorKind::InvalidLiteral,
+        }
+    }
+
+    fn unterminated_string(position: usize) -> Self {
+        Self {
+            message: "Unterminated string".to_string(),
+            position,
+            kind: JsonErrorKind::UnterminatedString,
+        }
+    }
+
+    fn invalid_escape_sequence(position: usize) -> Self {
+        Self {
+            message: "Invalid escape sequence".to_string(),
+            position,
+            kind: JsonErrorKind::InvalidEscapeSequence,
+        }
+    }
 }
 
 pub fn parse_json(input: &str) -> Result<JsonValue, JsonError> {
@@ -105,11 +140,7 @@ impl<'a> Tokenizer<'a> {
                 b'0'..=b'9' | b'-' => self.tokenize_number()?,
                 b'n' | b't' | b'f' => self.tokenize_literal()?,
                 _ => {
-                    return Err(JsonError {
-                        message: "Unexpected character".to_string(),
-                        position: self.position,
-                        kind: JsonErrorKind::UnexpectedCharacter,
-                    });
+                    return Err(JsonError::unexpected_character(self.position));
                 }
             };
 
@@ -132,21 +163,19 @@ impl<'a> Tokenizer<'a> {
             return Ok(Token::Boolean(false));
         }
 
-        Err(JsonError {
-            message: "Invalid Literal".to_string(),
-            position: self.position,
-            kind: JsonErrorKind::InvalidLiteral,
-        })
+        Err(JsonError::invalid_literal(self.position))
     }
 
     fn tokenize_string(&mut self) -> Result<Token, JsonError> {
         let mut result = String::new();
+        let mut string_terminated = false;
         self.increment_position(1);
 
         while self.has_more() {
             let next: char = match self.current_byte() {
                 b'"' => {
                     self.increment_position(1);
+                    string_terminated = true;
                     break;
                 }
                 b'\\' => {
@@ -195,44 +224,25 @@ impl<'a> Tokenizer<'a> {
                             self.increment_position(1);
 
                             if !self.has_more_than(3) {
-                                return Err(JsonError {
-                                    message: "Invalid string".to_string(),
-                                    position: self.position,
-                                    kind: JsonErrorKind::InvalidString,
-                                });
+                                return Err(JsonError::invalid_escape_sequence(self.position));
                             }
 
                             // Take the next 4 bytes and check they are hex
                             let escaped_bytes = &self.input[self.position..self.position + 4];
+
+                            let hex_str = std::str::from_utf8(escaped_bytes)
+                                .map_err(|_| JsonError::invalid_escape_sequence(self.position))?;
+
+                            let code_point = u16::from_str_radix(hex_str, 16)
+                                .map_err(|_| JsonError::invalid_escape_sequence(self.position))?;
+
+                            let val = std::char::from_u32(code_point as u32)
+                                .ok_or(JsonError::invalid_escape_sequence(self.position))?;
+
                             self.increment_position(4);
-
-                            let hex_str =
-                                std::str::from_utf8(escaped_bytes).map_err(|_| JsonError {
-                                    message: "Invalid string".to_string(),
-                                    position: self.position,
-                                    kind: JsonErrorKind::InvalidString,
-                                })?;
-
-                            let code_point =
-                                u16::from_str_radix(hex_str, 16).map_err(|_| JsonError {
-                                    message: "Invalid string".to_string(),
-                                    position: self.position,
-                                    kind: JsonErrorKind::InvalidString,
-                                })?;
-
-                            std::char::from_u32(code_point as u32).ok_or(JsonError {
-                                message: "Invalid string".to_string(),
-                                position: self.position,
-                                kind: JsonErrorKind::InvalidString,
-                            })?
+                            val
                         }
-                        _ => {
-                            return Err(JsonError {
-                                message: "Invalid string".to_string(),
-                                position: self.position,
-                                kind: JsonErrorKind::InvalidString,
-                            });
-                        }
+                        _ => return Err(JsonError::invalid_escape_sequence(self.position)),
                     }
                 }
                 _ => {
@@ -244,7 +254,11 @@ impl<'a> Tokenizer<'a> {
             result.push(next);
         }
 
-        Ok(Token::String(result))
+        if !string_terminated {
+            Err(JsonError::unterminated_string(self.position))
+        } else {
+            Ok(Token::String(result))
+        }
     }
 
     fn tokenize_number(&mut self) -> Result<Token, JsonError> {
@@ -532,6 +546,20 @@ mod test {
     }
 
     #[test]
+    fn returns_error_on_unexpected_character() {
+        let input = "!";
+        let error = Tokenizer::new(input.as_bytes()).tokenize().unwrap_err();
+        assert_eq!(error, JsonError::unexpected_character(0),);
+    }
+
+    #[test]
+    fn returns_error_on_invalid_literal() {
+        let input = "nil";
+        let error = Tokenizer::new(input.as_bytes()).tokenize().unwrap_err();
+        assert_eq!(error, JsonError::invalid_literal(0));
+    }
+
+    #[test]
     fn tokenize_true() {
         let input = "true";
         let tokens = Tokenizer::new(input.as_bytes()).tokenize().unwrap();
@@ -611,7 +639,9 @@ mod test {
 
     #[test]
     fn tokenize_string_with_escape() {
-        let input = "\"h\\u00e9llo\\nworld\\\"";
+        let input = "\"h\\u00e9llo\\nworld\\\"\"";
+
+        dbg!(input);
 
         println!("{}", input);
         let tokens = Tokenizer::new(input.as_bytes()).tokenize().unwrap();
@@ -626,5 +656,13 @@ mod test {
         expected_map.insert("hello".to_string(), JsonValue::Number(1.0));
 
         assert_eq!(parse_json(input).unwrap(), JsonValue::Object(expected_map));
+    }
+
+    #[test]
+    fn returns_error_on_unterminated_string() {
+        let input = r#""hello"#;
+        let error = Tokenizer::new(input.as_bytes()).tokenize().unwrap_err();
+
+        assert_eq!(error, JsonError::unterminated_string(6));
     }
 }
